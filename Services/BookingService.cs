@@ -1,0 +1,447 @@
+using CemaApp.Models;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Data.SqlClient;
+
+namespace CemaApp.Services
+{
+
+    public class BookingService : IBookingService
+    {
+        private readonly AppDbContext _context;
+        private readonly IMemoryCache _cache;
+        private const string CacheKeyPrefix = "SeatLock";
+        private const int LOCK_MINUTES = 7;
+
+        public BookingService(AppDbContext context, IMemoryCache cache)
+        {
+            _context = context;
+            _cache = cache;
+        }
+
+        private string GetCacheKey(int screeningId, int seatId) => $"{CacheKeyPrefix}:{screeningId}:{seatId}";
+
+        public async Task<bool> LockSeatAsync(int screeningId, int seatId, string userId)
+        {
+            using (var transaction = await _context.Database.BeginTransactionAsync())
+            {
+                try
+                {
+                    // Acquire application lock if SQL Server to synchronize concurrent requests for the same seat
+                    if (_context.Database.IsSqlServer())
+                    {
+                        var lockName = $"LockSeat:{screeningId}:{seatId}";
+                        var resourceParam = new SqlParameter("@Resource", lockName);
+                        var resultParam = new SqlParameter
+                        {
+                            ParameterName = "@Result",
+                            SqlDbType = System.Data.SqlDbType.Int,
+                            Direction = System.Data.ParameterDirection.Output
+                        };
+
+                        await _context.Database.ExecuteSqlRawAsync(
+                            "EXEC @Result = sp_getapplock @Resource = @Resource, @LockMode = 'Exclusive', @LockOwner = 'Transaction', @LockTimeout = 1000",
+                            resultParam, resourceParam);
+
+                        var value = resultParam.Value;
+                        int result = (value == null || value == DBNull.Value) ? -1 : (int)value;
+                        if (result < 0)
+                        {
+                            await transaction.RollbackAsync();
+                            return false; // Failed to acquire lock within 5 seconds
+                        }
+                    }
+
+                    // Clean up expired pending bookings first
+                    await CleanExpiredPendingBookingsAsync();
+
+                    // 1. Check if seat is permanently booked in DB
+                    var isBooked = await _context.BookingSeats
+                        .AnyAsync(bs => bs.Booking.ScreeningId == screeningId
+                                     && bs.SeatId == seatId
+                                     && bs.Booking.Status == BookingStatus.Confirmed);
+
+                    if (isBooked)
+                    {
+                        await transaction.RollbackAsync();
+                        return false;
+                    }
+
+                    // 2. Check if seat is locked by another user via a Pending booking
+                    var existingPendingLock = await _context.BookingSeats
+                        .Include(bs => bs.Booking)
+                        .FirstOrDefaultAsync(bs => bs.Booking.ScreeningId == screeningId
+                                                 && bs.SeatId == seatId
+                                                 && bs.Booking.Status == BookingStatus.Pending
+                                                 && bs.Booking.UserId != userId);
+
+                    if (existingPendingLock != null)
+                    {
+                        // Check if the lock is still within the 7 min window
+                        if (existingPendingLock.Booking.BookingDate.AddMinutes(LOCK_MINUTES) > DateTime.Now)
+                        {
+                            await transaction.RollbackAsync();
+                            return false; // Locked by someone else
+                        }
+                    }
+
+                    var cacheKey = GetCacheKey(screeningId, seatId);
+
+                    // 3. Check if seat is already locked by the current user (Toggle/Deselect action)
+                    bool isLockedBySelfInCache = _cache.TryGetValue(cacheKey, out string? cachedUserId) && cachedUserId == userId;
+
+                    var pendingBooking = await _context.Bookings
+                        .Include(b => b.BookingSeats)
+                        .FirstOrDefaultAsync(b => b.ScreeningId == screeningId
+                                               && b.UserId == userId
+                                               && b.Status == BookingStatus.Pending);
+
+                    bool isLockedBySelfInDb = pendingBooking != null && pendingBooking.BookingSeats.Any(bs => bs.SeatId == seatId);
+
+                    if (isLockedBySelfInCache || isLockedBySelfInDb)
+                    {
+                        // Remove lock from cache
+                        _cache.Remove(cacheKey);
+
+                        // Remove seat from pending booking in DB
+                        if (pendingBooking != null)
+                        {
+                            var seatToRemove = pendingBooking.BookingSeats.FirstOrDefault(bs => bs.SeatId == seatId);
+                            if (seatToRemove != null)
+                            {
+                                pendingBooking.BookingSeats.Remove(seatToRemove);
+                                
+                                var screening = await _context.Screenings.FindAsync(screeningId);
+                                if (screening != null)
+                                {
+                                    int remainingCount = pendingBooking.BookingSeats.Count;
+                                    if (remainingCount > 0)
+                                    {
+                                        pendingBooking.TotalPrice = remainingCount * screening.Price;
+                                    }
+                                    else
+                                    {
+                                        // No seats left, clean up the pending booking header
+                                        _context.Bookings.Remove(pendingBooking);
+                                    }
+                                }
+                            }
+                            await _context.SaveChangesAsync();
+                        }
+                        await transaction.CommitAsync();
+                        return true;
+                    }
+
+                    // 4. Check if seat is locked in MemoryCache by someone else
+                    if (_cache.TryGetValue(cacheKey, out string? existingUserId) && existingUserId != userId)
+                    {
+                        await transaction.RollbackAsync();
+                        return false; // Locked by someone else
+                    }
+
+                    // 5. Set the lock with 7-minute expiration in cache
+                    var cacheOptions = new MemoryCacheEntryOptions()
+                        .SetAbsoluteExpiration(TimeSpan.FromMinutes(LOCK_MINUTES));
+
+                    _cache.Set(cacheKey, userId, cacheOptions);
+
+                    // 6. Create a new Pending booking if one doesn't exist
+                    if (pendingBooking == null)
+                    {
+                        var screening = await _context.Screenings.FindAsync(screeningId);
+                        if (screening == null)
+                        {
+                            await transaction.RollbackAsync();
+                            return false;
+                        }
+
+                        pendingBooking = new Booking
+                        {
+                            UserId = userId,
+                            ScreeningId = screeningId,
+                            BookingDate = DateTime.Now,
+                            TotalPrice = screening.Price,
+                            Status = BookingStatus.Pending
+                        };
+                        _context.Bookings.Add(pendingBooking);
+                        await _context.SaveChangesAsync();
+                    }
+
+                    // 7. Add seat to the pending booking
+                    var alreadyAdded = pendingBooking.BookingSeats.Any(bs => bs.SeatId == seatId);
+                    if (!alreadyAdded)
+                    {
+                        pendingBooking.BookingSeats.Add(new BookingSeat
+                        {
+                            SeatId = seatId
+                        });
+
+                        var screening2 = await _context.Screenings.FindAsync(screeningId);
+                        if (screening2 != null)
+                        {
+                            pendingBooking.TotalPrice = pendingBooking.BookingSeats.Count * screening2.Price;
+                        }
+
+                        await _context.SaveChangesAsync();
+                    }
+
+                    await transaction.CommitAsync();
+                    return true;
+                }
+                catch
+                {
+                    await transaction.RollbackAsync();
+                    throw;
+                }
+            }
+        }
+
+        public async Task<bool> ConfirmBookingAsync(int screeningId, List<int> seatIds, string userId)
+        {
+            if (seatIds == null || !seatIds.Any()) return false;
+
+            using (var transaction = await _context.Database.BeginTransactionAsync())
+            {
+                try
+                {
+                    // Acquire application locks if SQL Server to synchronize concurrent confirmation requests for the same seats
+                    if (_context.Database.IsSqlServer())
+                    {
+                        foreach (var seatId in seatIds)
+                        {
+                            var lockName = $"LockSeat:{screeningId}:{seatId}";
+                            var resourceParam = new SqlParameter("@Resource", lockName);
+                            var resultParam = new SqlParameter
+                            {
+                                ParameterName = "@Result",
+                                SqlDbType = System.Data.SqlDbType.Int,
+                                Direction = System.Data.ParameterDirection.Output
+                            };
+
+                            await _context.Database.ExecuteSqlRawAsync(
+                                "EXEC @Result = sp_getapplock @Resource = @Resource, @LockMode = 'Exclusive', @LockOwner = 'Transaction', @LockTimeout = 5000",
+                                resultParam, resourceParam);
+
+                            var value = resultParam.Value;
+                            int result = (value == null || value == DBNull.Value) ? -1 : (int)value;
+                            if (result < 0)
+                            {
+                                await transaction.RollbackAsync();
+                                return false; // Failed to acquire lock
+                            }
+                        }
+                    }
+
+                    // 1. Double check that none of the seats are already booked (Confirmed)
+                    var alreadyBooked = await _context.BookingSeats
+                        .AnyAsync(bs => bs.Booking!.ScreeningId == screeningId
+                                     && bs.Booking!.Status == BookingStatus.Confirmed
+                                     && seatIds.Contains(bs.SeatId));
+
+                    if (alreadyBooked)
+                    {
+                        await transaction.RollbackAsync();
+                        return false; // Already booked by someone else!
+                    }
+
+                    // 2. Look for the existing Pending booking
+                    var pendingBooking = await _context.Bookings
+                        .Include(b => b.BookingSeats)
+                        .FirstOrDefaultAsync(b => b.ScreeningId == screeningId
+                                               && b.UserId == userId
+                                               && b.Status == BookingStatus.Pending);
+
+                    // Verify the DB lock has not expired
+                    if (pendingBooking != null && pendingBooking.BookingDate.AddMinutes(LOCK_MINUTES) < DateTime.Now)
+                    {
+                        await transaction.RollbackAsync();
+                        return false;
+                    }
+
+                    // Verify locks still exist for this user in MemoryCache OR in the DB pending booking
+                    foreach (var seatId in seatIds)
+                    {
+                        var cacheKey = GetCacheKey(screeningId, seatId);
+                        bool hasCacheLock = _cache.TryGetValue(cacheKey, out string? lockedUser) && lockedUser == userId;
+                        bool hasDbLock = pendingBooking != null && pendingBooking.BookingSeats.Any(bs => bs.SeatId == seatId);
+
+                        if (!hasCacheLock && !hasDbLock)
+                        {
+                            await transaction.RollbackAsync();
+                            return false; // Lock expired or doesn't belong to user
+                        }
+                    }
+
+                    if (pendingBooking != null)
+                    {
+                        // Update existing pending booking to Confirmed
+                        var screening = await _context.Screenings.FindAsync(screeningId);
+                        if (screening == null)
+                        {
+                            await transaction.RollbackAsync();
+                            return false;
+                        }
+
+                        pendingBooking.Status = BookingStatus.Confirmed;
+                        pendingBooking.BookingDate = DateTime.Now;
+                        pendingBooking.TotalPrice = seatIds.Count * screening.Price;
+
+                        // Remove old seats and add the confirmed ones
+                        pendingBooking.BookingSeats.Clear();
+                        foreach (var seatId in seatIds)
+                        {
+                            pendingBooking.BookingSeats.Add(new BookingSeat
+                            {
+                                SeatId = seatId
+                            });
+                            _cache.Remove(GetCacheKey(screeningId, seatId));
+                        }
+
+                        await _context.SaveChangesAsync();
+                        await transaction.CommitAsync();
+                        return true;
+                    }
+                    else
+                    {
+                        // Fallback: create a new Confirmed booking (original behavior)
+                        var screening = await _context.Screenings.FindAsync(screeningId);
+                        if (screening == null)
+                        {
+                            await transaction.RollbackAsync();
+                            return false;
+                        }
+
+                        var booking = new Booking
+                        {
+                            UserId = userId,
+                            ScreeningId = screeningId,
+                            BookingDate = DateTime.Now,
+                            TotalPrice = seatIds.Count * screening.Price,
+                            Status = BookingStatus.Confirmed
+                        };
+
+                        _context.Bookings.Add(booking);
+                        await _context.SaveChangesAsync();
+
+                        foreach (var seatId in seatIds)
+                        {
+                            _context.BookingSeats.Add(new BookingSeat
+                            {
+                                BookingId = booking.Id,
+                                SeatId = seatId
+                            });
+                            _cache.Remove(GetCacheKey(screeningId, seatId));
+                        }
+
+                        await _context.SaveChangesAsync();
+                        await transaction.CommitAsync();
+                        return true;
+                    }
+                }
+                catch
+                {
+                    await transaction.RollbackAsync();
+                    throw;
+                }
+            }
+        }
+
+        public async Task<List<SeatDto>> GetSeatsWithStatusAsync(int screeningId, string userId)
+        {
+            // Fetch screening layout and seats
+            var screening = await _context.Screenings
+                .Include(s => s.Hall)
+                .ThenInclude(h => h!.Seats)
+                .AsNoTracking()
+                .FirstOrDefaultAsync(s => s.Id == screeningId);
+
+            if (screening == null || screening.Hall == null) return new List<SeatDto>();
+
+            // Cutoff date for active pending reservations
+            var cutoff = DateTime.Now.AddMinutes(-LOCK_MINUTES);
+
+            // Retrieve all active booking seats in a single database query
+            var activeBookingSeats = await _context.BookingSeats
+                .AsNoTracking()
+                .Where(bs => bs.Booking!.ScreeningId == screeningId
+                          && (bs.Booking!.Status == BookingStatus.Confirmed
+                              || (bs.Booking!.Status == BookingStatus.Pending && bs.Booking!.BookingDate > cutoff)))
+                .Select(bs => new { bs.SeatId, UserId = bs.Booking!.UserId, Status = bs.Booking!.Status })
+                .ToListAsync();
+
+            // Map results to HashSets for fast O(1) in-memory lookups
+            var bookedSeatIds = activeBookingSeats
+                .Where(x => x.Status == BookingStatus.Confirmed)
+                .Select(x => x.SeatId)
+                .ToHashSet();
+
+            var pendingLockedSeatIds = activeBookingSeats
+                .Where(x => x.Status == BookingStatus.Pending && x.UserId != userId)
+                .Select(x => x.SeatId)
+                .ToHashSet();
+
+            var currentUserPendingSeatIds = activeBookingSeats
+                .Where(x => x.Status == BookingStatus.Pending && x.UserId == userId)
+                .Select(x => x.SeatId)
+                .ToHashSet();
+
+            var seats = new List<SeatDto>();
+
+            foreach (var seat in screening.Hall.Seats)
+            {
+                var state = SeatState.Available;
+
+                if (bookedSeatIds.Contains(seat.Id))
+                {
+                    state = SeatState.Booked;
+                }
+                else if (pendingLockedSeatIds.Contains(seat.Id))
+                {
+                    state = SeatState.Locked;
+                }
+                else if (currentUserPendingSeatIds.Contains(seat.Id))
+                {
+                    state = SeatState.Selected;
+                }
+                else
+                {
+                    var cacheKey = GetCacheKey(screeningId, seat.Id);
+                    if (_cache.TryGetValue(cacheKey, out string? lockedUserId))
+                    {
+                        state = (lockedUserId == userId) ? SeatState.Selected : SeatState.Locked;
+                    }
+                }
+
+                seats.Add(new SeatDto
+                {
+                    Id = seat.Id,
+                    Row = seat.Row,
+                    Number = seat.Number,
+                    State = state.ToString()
+                });
+            }
+
+            return seats;
+        }
+
+        public async Task CleanExpiredPendingBookingsAsync()
+        {
+            var cutoff = DateTime.Now.AddMinutes(-LOCK_MINUTES);
+            var expired = await _context.Bookings
+                .Include(b => b.BookingSeats)
+                .Where(b => b.Status == BookingStatus.Pending && b.BookingDate < cutoff)
+                .ToListAsync();
+
+            if (expired.Any())
+            {
+                foreach (var booking in expired)
+                {
+                    _context.BookingSeats.RemoveRange(booking.BookingSeats);
+                }
+                _context.Bookings.RemoveRange(expired);
+                await _context.SaveChangesAsync();
+            }
+        }
+    }
+
+}
