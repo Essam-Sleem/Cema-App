@@ -102,49 +102,6 @@ Views consist of HTML templates mixed with Razor syntax to dynamically generate 
 
 ---
 
-## How the Reservation System Works
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor User as Customer
-    participant BC as BookingController
-    participant BS as BookingService
-    participant DB as SQL Database
-    participant Cache as MemoryCache
-
-    User->>BC: Clicks a screening (SelectSeats)
-    BC->>DB: Checks for active pending bookings
-    BC-->>User: Renders Seat Map with countdown timer
-
-    rect rgb(240, 248, 255)
-        note right of User: Seat Selection (Toggle)
-        User->>BC: Click Seat (ToggleSeat AJAX)
-        BC->>BS: LockSeatAsync(screeningId, seatId, userId)
-        BS->>DB: Acquire sp_getapplock & remove expired locks
-        BS->>DB: Checks if seat is permanently confirmed
-        alt Seat is available
-            BS->>Cache: Add seat lock for 7 minutes
-            BS->>DB: Create/Update Pending Booking & BookingSeat
-            BS-->>BC: Return success
-            BC-->>User: Update Seat to "Selected" (Green)
-        else Seat is occupied/locked by another
-            BS-->>BC: Return failure
-            BC-->>User: Keep Seat "Locked/Booked" (Red)
-        end
-    end
-
-    rect rgb(245, 245, 245)
-        note right of User: Confirmation
-        User->>BC: Click Confirm (ConfirmBooking)
-        BC->>BS: ConfirmBookingAsync(screeningId, seatIds, userId)
-        BS->>DB: Double-checks seat status & lock validity
-        BS->>DB: Updates Booking status to 'Confirmed'
-        BS->>Cache: Clear temporary seat locks
-        BS-->>BC: Return success
-        BC-->>User: Redirects to booking history list
-    end
-```
 
 ### 1. The Locking Phase
 When a customer lands on the seat map, the system calls an API to load all seats. For each seat, it checks:
